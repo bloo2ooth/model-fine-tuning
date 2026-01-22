@@ -1,118 +1,55 @@
 import pandas as pd
 from datasets import load_dataset
 import re
-import sys
 
-# ==============================================================================
-# 1. KEYWORD LISTS
-# ==============================================================================
-keywords = {
-    # 1. POSITIVE FILTER: If the text doesn't contain one of these, THROW IT OUT.
-    "relevance_triggers": [
-        'money', 'cash', 'dollar', 'euro', 'currency', 'finance', 'financial',
-        'bank', 'economy', 'economic', 'market', 'stock', 'share', 'invest',
-        'trade', 'trading', 'profit', 'loss', 'tax', 'debt', 'loan', 'credit',
-        'interest', 'rate', 'mortgage', 'rent', 'salary', 'income', 'expense',
-        'budget', 'cost', 'price', 'worth', 'value', 'asset', 'liability',
-        'growth', 'inflation', 'recession', 'capital', 'wealth', 'savings',
-        'deposit', 'withdraw', 'account', 'fund', 'wallet', 'coin', 'payment',
-        'retirement', 'pension', '401k', 'ira', 'tax', 'fiscal', 'monetary',
-        'business', 'corporate', 'revenue', 'earning', 'audit', 'insurance',
-        'bullish', 'bearish', 'yield', 'dividend', 'portfolio'
-    ],
+# 1. SCORING DICTIONARY
+# We give points for every financial word found.
+financial_terms = [
+    'stock', 'market', 'share', 'price', 'invest', 'trade', 'trading', 'value', 
+    'money', 'cash', 'currency', 'fund', 'etf', 'dividend', 'yield', 'return',
+    'profit', 'loss', 'margin', 'equity', 'debt', 'bond', 'treasury', 'interest',
+    'rate', 'tax', '401k', 'ira', 'pension', 'retirement', 'portfolio', 'asset',
+    'liability', 'bullish', 'bearish', 'short', 'long', 'option', 'future',
+    'volatility', 'risk', 'sector', 'cap', 'valuation', 'earnings', 'revenue',
+    'crypto', 'bitcoin', 'ethereum', 'wallet', 'blockchain'
+]
 
-    # 2. INSTRUMENTS (For Specificity Check)
-    "instruments": [
-        'apple', 'aapl', 'microsoft', 'msft', 'google', 'goog', 'amazon', 'amzn', 
-        'nvidia', 'nvda', 'meta', 'tesla', 'tsla', 'netflix', 'jpmorgan', 'goldman',
-        'bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 's&p 500', 'spy', 'qqq', 
-        '401k', 'roth', 'ira', 'bond', 'treasury', 'gold', 'oil', 'real estate'
-    ],
+def calculate_financial_score(text):
+    text = str(text).lower()
+    score = 0
+    # Add 1 point for every occurrence of a financial term
+    for term in financial_terms:
+        # We use simple string count for speed and "density"
+        score += text.count(term)
+    return score
 
-    # 3. ADVICE TRIGGERS (For Danger Check)
-    "advice_triggers": [
-        r'\brecommend\b', r'\bshould\b', r'\bought to\b', r'\bbetter to\b', 
-        r'\bwise to\b', r'\bgood time to\b', r'\bundervalued\b', r'\bovervalued\b',
-        r'\btarget price\b', r'\bstrong buy\b', r'\bstrong sell\b', r'\bportfolio allocation\b'
-    ],
-    
-    # 4. GUIDANCE INDICATORS (Safe Zone)
-    "guidance_indicators": [
-        r'\bhow do i\b', r'\bhow to\b', r'\bwhat is\b', r'\bdefine\b', 
-        r'\bhistory of\b', r'\bexplain\b', r'\bmeaning of\b'
-    ]
-}
-
-# ==============================================================================
-# 2. LOGIC
-# ==============================================================================
-def classify_row(row):
-    text = (str(row['instruction']) + " " + str(row['output'])).lower()
-    
-    # STEP 1: IS IT EVEN RELEVANT? (The New Filter)
-    # If no financial words are found, mark as INVALID immediately.
-    is_relevant = any(w in text for w in keywords["relevance_triggers"])
-    if not is_relevant:
-        return "Invalid" # This kicks out the recipes/stories
-        
-    # STEP 2: IS IT PROCEDURAL? (Guidance)
-    if any(re.search(p, text) for p in keywords["guidance_indicators"]):
-        return "Guidance"
-
-    # STEP 3: DOES IT HAVE SPECIFIC PRODUCTS?
-    has_instrument = any(re.search(rf'\b{re.escape(w)}\b', text) for w in keywords["instruments"])
-    
-    # STEP 4: DOES IT GIVE A RECOMMENDATION?
-    has_advice = any(re.search(p, text) for p in keywords["advice_triggers"])
-    
-    # --- FINAL CATEGORIES ---
-    if has_instrument and has_advice:
-        return "Advice"
-    elif ("i am" in text or "my age" in text) and not has_instrument:
-        return "Edge Case"
-    else:
-        # If it's financial but not advice/personal, it's safe Guidance
-        return "Guidance"
-
-# ==============================================================================
-# 3. EXECUTION
-# ==============================================================================
 def main():
-    print("--- Starting RELEVANCE-FILTERED Sampling ---")
-    
+    print("--- 1. Loading Data ---")
     dataset = load_dataset("gbharti/finance-alpaca", split='train')
     df = dataset.to_pandas()
     
-    # Filter empty inputs (Reading comprehension removal)
-    df_clean = df[df['input'].astype(str).str.strip() == ''].copy()
+    # Filter empty inputs (keep pure Q&A)
+    df = df[df['input'].astype(str).str.strip() == ''].copy()
     
-    print("Applying logic...")
-    df_clean['presumed_label'] = df_clean.apply(classify_row, axis=1)
+    # 2. CALCULATE DENSITY SCORE
+    print("--- 2. Ranking by Financial Density ---")
+    # specific_text combines instruction and output for scoring
+    df['combined_text'] = df['instruction'].astype(str) + " " + df['output'].astype(str)
+    df['financial_score'] = df['combined_text'].apply(calculate_financial_score)
     
-    # REMOVE THE INVALID ROWS
-    df_financial = df_clean[df_clean['presumed_label'] != "Invalid"]
-    print(f"   > Removed {len(df_clean) - len(df_financial)} non-financial rows.")
-    print(f"   > Remaining Financial Pool: {len(df_financial)}")
+    # 3. SORT AND TAKE TOP CANDIDATES
+    df_sorted = df.sort_values(by='financial_score', ascending=False).head(500)
+    
+    print(f"Top ranked sample score: {df_sorted['financial_score'].iloc[0]}")
+    print(f"Lowest ranked sample score: {df_sorted['financial_score'].iloc[-1]}")
 
-    print("Sampling best 100...")
-    try:
-        advice = df_financial[df_financial['presumed_label'] == "Advice"].sample(40, random_state=42)
-        
-        edge_pool = df_financial[df_financial['presumed_label'] == "Edge Case"]
-        edge = edge_pool.sample(min(30, len(edge_pool)), random_state=42)
-        
-        guidance = df_financial[df_financial['presumed_label'] == "Guidance"].sample(30, random_state=42)
-        
-        golden_set = pd.concat([advice, edge, guidance])
-        final_table = golden_set[['instruction', 'output', 'presumed_label']].copy()
+    # 4. EXPORT FOR HAND-PICKING
+    output_df = df_sorted[['instruction', 'output', 'financial_score']]
+    output_df.to_csv("candidates_ranked_by_quality.csv", index=False)
+    
+    print("\nSUCCESS!")
+    print("Saved 'candidates_ranked_by_quality.csv'.")
 
-        # Overwrite the existing CSV
-        final_table.to_csv("logbook_validation_100_readable.csv", index=False)
-        final_table.to_json("logbook_validation_100.jsonl", orient="records", lines=True)
-        print("\nSuccess! Overwrote 'logbook_validation_100_readable.csv'")
-
-    except Exception as e:
-        print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
