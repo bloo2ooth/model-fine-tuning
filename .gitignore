@@ -1,0 +1,33 @@
+# Virtual environment
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Data files (can be large)
+data/*.jsonl
+data/*.csv
+data/*.json
+models/*.bin
+models/*.safetensors
+
+# GCP credentials
+gcp-key.json
+*.json  # Service account keys
+
+# Environment variables
+.env
+
+# OS files
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model outputs
+model_output/
