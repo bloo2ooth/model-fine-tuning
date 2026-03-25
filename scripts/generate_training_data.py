@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import signal
 import sys
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # In-memory dataset -- signal handler needs access to this
 dataset = []
@@ -217,6 +218,27 @@ def generate_example(scenario, retry_count=2):
     print(f"[DEBUG] Giving up after {retry_count} attempts")
     return None
 
+def generate_examples_concurrent(scenario, count, max_workers=5):
+    """
+    Generate 'count' examples for a scenario using concurrent threads.
+    Submits more jobs than needed to account for failures/retries.
+    """
+    results = []
+    # Submit double the required count to account for failures
+    jobs_to_submit = count * 2
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(generate_example, scenario) for _ in range(jobs_to_submit)]
+
+        for future in as_completed(futures):
+            if len(results) >= count:
+                break  # Stop accepting results once we have enough
+            result = future.result()
+            if result is not None:
+                results.append(result)
+                print(f"[PROGRESS] {len(results)}/{count} for {scenario['output_type']}")
+
+    return results[:count]  # Never return more than requested
 
 def create_training_dataset(num_examples=3000):
     """Generate training dataset with runtime limit."""
@@ -239,35 +261,17 @@ def create_training_dataset(num_examples=3000):
     for scenario_idx, scenario in enumerate(SCENARIOS):
         print(f"\n[{scenario_idx+1}/{len(SCENARIOS)}] Generating {examples_per_scenario} examples for: {scenario['output_type']}")
 
-        successful = 0
-        attempts = 0
-        max_attempts = examples_per_scenario * 2
-        progress_bar = tqdm(total=examples_per_scenario)
+        if not check_runtime_limit():
+            print(f"\nSTOPPING GENERATION - Runtime limit reached")
+            print(f"Generated {len(dataset)} examples so far")
+            return dataset
 
-        while successful < examples_per_scenario and attempts < max_attempts:
+        results = generate_examples_concurrent(scenario, examples_per_scenario, max_workers=5)
+        dataset.extend(results)
 
-            if not check_runtime_limit():
-                progress_bar.close()
-                print(f"\nSTOPPING GENERATION - Runtime limit reached")
-                print(f"Generated {len(dataset)} examples so far")
-                return dataset
+        elapsed = (datetime.datetime.now() - START_TIME).total_seconds() / 3600
+        print(f"Generated {len(results)}/{examples_per_scenario} | Elapsed: {elapsed:.2f}h")
 
-            example = generate_example(scenario)
-            attempts += 1
-
-            if example:
-                dataset.append(example)
-                successful += 1
-                progress_bar.update(1)
-
-            # Rate limiting -- print elapsed time every 10 attempts
-            if attempts % 10 == 0:
-                time.sleep(2)
-                elapsed = (datetime.datetime.now() - START_TIME).total_seconds() / 3600
-                print(f"\nElapsed: {elapsed:.2f}h")
-
-        progress_bar.close()
-        print(f"Generated {successful}/{examples_per_scenario}")
 
         # Save checkpoint after every scenario in case of failure
         with open('data/training_data_checkpoint.json', 'w') as f:
