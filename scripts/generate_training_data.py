@@ -6,6 +6,28 @@ from google.cloud import aiplatform
 from dotenv import load_dotenv
 import sys
 
+def shutdown_vm():
+    """Shutdown the VM after completion"""
+    print("\n" + "=" * 70)
+    print("🛑 INITIATING VM SHUTDOWN")
+    print("=" * 70)
+    print("Shutting down in 30 seconds...")
+    print("Press Ctrl+C NOW if you need to cancel!")
+    print("=" * 70)
+    
+    try:
+        time.sleep(30)  # Give you time to cancel if needed
+        
+        # METHOD 1: Simple shutdown (recommended)
+        print("Executing shutdown command...")
+        os.system('sudo poweroff')
+        
+    except KeyboardInterrupt:
+        print("\n⚠️ Shutdown cancelled by user")
+        return False
+    
+    return True
+
 # Load environment variables
 load_dotenv()
 
@@ -16,10 +38,11 @@ ENDPOINT_ID = os.getenv('TEACHER_ENDPOINT_ID')
 # ============================================================
 # COST SAFETY LIMITS - DO NOT EXCEED
 # ============================================================
-MAX_EXAMPLES = 5000  # Hard cap on examples to generate
+MAX_EXAMPLES = 3000  # Hard cap on examples to generate
 MAX_RUNTIME_HOURS = 24  # Auto-stop after 24 hours
 ESTIMATED_COST_PER_HOUR = 4  # €4/hour for g4-standard-96 (2× RTX PRO 6000)
-MAX_BUDGET_EUR = 100  # Stop if estimated cost exceeds €30
+MAX_BUDGET_EUR = 140  # Stop if estimated cost exceeds €100
+
 
 # Track start time
 import datetime
@@ -89,7 +112,7 @@ def call_teacher_model(prompt):
     try:
         endpoint = aiplatform.Endpoint(ENDPOINT_ID)
         
-        full_prompt = f"""You are a financial compliance expert. Generate a realistic financial Q&A example and classify it.
+        full_prompt = f"""{SYSTEM_PROMPT}
 
 {prompt}
 
@@ -105,7 +128,11 @@ Respond with ONLY valid JSON (no extra text):
             }]
         )
         
+        if not response.predictions or len(response.predictions) == 0:
+            print("[DEBUG] Empty predictions response")
+            return None
         output_text = response.predictions[0]
+
         
         # Remove prefix labels
         if "Output:" in output_text:
@@ -156,6 +183,8 @@ Respond with ONLY valid JSON (no extra text):
                                     "specific_action": is_advice,
                                     "persuasive_intent": is_advice
                                 }
+                            elif not isinstance(result['criteria_met'], dict):
+                                return None
                             return result
                         else:
                             return None
@@ -194,7 +223,8 @@ def generate_example(scenario, retry_count=2):
 
 def create_training_dataset(num_examples=5000):
     """Generate training dataset with safety limits"""
-    
+    #make sure the data directory exists
+    os.makedirs('data', exist_ok=True)
     # Safety check: Don't exceed MAX_EXAMPLES
     num_examples = min(num_examples, MAX_EXAMPLES)
     
@@ -260,60 +290,119 @@ if __name__ == "__main__":
         print("❌ Error: TEACHER_ENDPOINT_ID not set in .env file")
         exit(1)
     
+    # Validate scenarios
+    if not SCENARIOS or len(SCENARIOS) == 0:
+        print("❌ Error: No scenarios found in SCENARIOS")
+        exit(1)
+    
+    # Ensure data directory exists
+    os.makedirs('data', exist_ok=True)
+    
     # Confirm before starting
     print("\n⚠️  COST CONFIRMATION")
-    print(f"Estimated cost: €{ESTIMATED_COST_PER_HOUR * MAX_RUNTIME_HOURS:.2f} (max)")
-    print(f"Your budget: €{MAX_BUDGET_EUR}")
+    print(f"Target examples: 3000")
+    print(f"Estimated time: ~8-12 hours (depending on success rate)")
+    print(f"Estimated cost: €32-48 (max €{MAX_BUDGET_EUR})")
+    print(f"Your remaining credit: €150")
     response = input("\nProceed? (yes/no): ")
     
     if response.lower() != 'yes':
         print("Cancelled.")
         exit(0)
     
-    # Generate data
-    training_data = create_training_dataset(num_examples=5000)
+    try:
+        # Generate data
+        training_data = create_training_dataset(num_examples=3000)  # Changed from 5000
+        
+        # Calculate actual cost
+        elapsed_hours = (datetime.datetime.now() - START_TIME).total_seconds() / 3600
+        actual_cost = elapsed_hours * ESTIMATED_COST_PER_HOUR
+        
+        print("\n" + "=" * 70)
+        print("GENERATION COMPLETE")
+        print("=" * 70)
+        print(f"Total examples: {len(training_data)}")
+        print(f"Time elapsed: {elapsed_hours:.2f} hours")
+        print(f"Estimated cost: €{actual_cost:.2f}")
+        print("=" * 70)
+        
+        # Save final data
+        print("\nSaving data...")
+        with open('data/training_data_raw.json', 'w') as f:
+            json.dump(training_data, f, indent=2)
+        
+        # Format for Qwen fine-tuning (ChatML format)
+        formatted_data = []
+        skipped = 0
+
+        for item in training_data:
+            # Validate all required fields exist before formatting
+            if not all(k in item for k in ['llm_output', 'classification', 'reasoning', 'criteria_met']):
+                skipped += 1
+                continue
+            
+            if not isinstance(item['criteria_met'], dict):
+                skipped += 1
+                continue
+
+            formatted_data.append({
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a financial regulation compliance expert. Analyse LLM outputs and classify whether they constitute financial advice, providing detailed reasoning."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Classify whether the following LLM output constitutes financial advice:\n\n{item['llm_output']}"
+                    },
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"Classification: {item['classification']}\n\n"
+                            f"Reasoning: {item['reasoning']}\n\n"
+                            f"Criteria assessment:\n"
+                            f"- Personalised to individual circumstances: {item['criteria_met']['personalized']}\n"
+                            f"- Recommends specific action on financial product: {item['criteria_met']['specific_action']}\n"
+                            f"- Persuasive intent: {item['criteria_met']['persuasive_intent']}"
+                        )
+                    }
+                ]
+            })
+
+        # Save as JSONL (one JSON object per line — standard for fine-tuning)
+        with open('data/training_data_qwen.jsonl', 'w') as f:
+            for item in formatted_data:
+                f.write(json.dumps(item) + '\n')
+
+        print(f"✓ Formatted {len(formatted_data)} examples ({skipped} skipped due to missing fields)")
+        print(f"✓ Saved to data/training_data_qwen.jsonl")
+
+        
+        # Statistics
+        if len(training_data) > 0:
+            advice_count = sum(1 for d in training_data if d['classification'] == 'ADVICE')
+            not_advice_count = len(training_data) - advice_count
+            
+            print(f"\nDataset Statistics:")
+            print(f"  Total: {len(training_data)}")
+            print(f"  ADVICE: {advice_count} ({advice_count/len(training_data)*100:.1f}%)")
+            print(f"  NOT_ADVICE: {not_advice_count} ({not_advice_count/len(training_data)*100:.1f}%)")
+        else:
+            print("\n⚠️ WARNING: No examples generated!")
+        
+        print("\n✅ SUCCESS - All data generated and saved!")
+        
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        print("Data checkpoint may be available at: data/training_data_checkpoint.json")
     
-    # Calculate actual cost
-    elapsed_hours = (datetime.datetime.now() - START_TIME).total_seconds() / 3600
-    actual_cost = elapsed_hours * ESTIMATED_COST_PER_HOUR
-    
-    print("\n" + "=" * 70)
-    print("GENERATION COMPLETE")
-    print("=" * 70)
-    print(f"Total examples: {len(training_data)}")
-    print(f"Time elapsed: {elapsed_hours:.2f} hours")
-    print(f"Estimated cost: €{actual_cost:.2f}")
-    print("=" * 70)
-    
-    # Save final data
-    print("\nSaving data...")
-    with open('data/training_data_raw.json', 'w') as f:
-        json.dump(training_data, f, indent=2)
-    
-    # Format for training
-    formatted_data = []
-    for item in training_data:
-        formatted_data.append({
-            "instruction": "Classify whether this LLM output constitutes financial advice. Provide reasoning then label.",
-            "input": item['llm_output'],
-            "reasoning": item['reasoning'],
-            "output": item['classification']
-        })
-    
-    with open('data/training_data_formatted.jsonl', 'w') as f:
-        for item in formatted_data:
-            f.write(json.dumps(item) + '\n')
-    
-    print("✓ Data saved!")
-    
-    # Statistics
-    advice_count = sum(1 for d in training_data if d['classification'] == 'ADVICE')
-    not_advice_count = len(training_data) - advice_count
-    
-    print(f"\nDataset Statistics:")
-    print(f"  Total: {len(training_data)}")
-    print(f"  ADVICE: {advice_count} ({advice_count/len(training_data)*100:.1f}%)")
-    print(f"  NOT_ADVICE: {not_advice_count} ({not_advice_count/len(training_data)*100:.1f}%)")
-    
-    print("\n⚠️  IMPORTANT: Remember to undeploy your endpoint to stop charges!")
-    print("Run: gcloud ai endpoints undeploy-model YOUR_ENDPOINT_ID --region=YOUR_REGION")
+    finally:
+        # Always attempt shutdown, even if there was an error
+        print("\n" + "=" * 70)
+        print("ATTEMPTING AUTOMATIC VM SHUTDOWN")
+        print("=" * 70)
+        shutdown_vm()
+
+
+
+        
