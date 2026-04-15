@@ -1,16 +1,20 @@
 import json
+from collections import Counter
 
 with open("training_data_checkpoint.json", "r") as f:
     data = json.load(f)
 
-print(f"Total records: {len(data)}")
-print("\n--- First record ---")
-print(json.dumps(data[0], indent=2))
+# Basic stats
+classifications = Counter(x["classification"] for x in data)
+scenarios = Counter(x["scenario_type"] for x in data)
+bad = [i for i, x in enumerate(data) if x["llm_output"].strip() == "..."]
 
-# Find and print the first record that looks like a failure
-for i, record in enumerate(data):
-    content = str(record)
-    if "error" in content.lower() or "failed" in content.lower() or "none" in content.lower():
-        print(f"\n--- First suspicious record (index {i}) ---")
-        print(json.dumps(record, indent=2))
-        break
+print(f"Total examples:       {len(data)}")
+print(f"Bad examples ('...'): {len(bad)} ({len(bad)/len(data)*100:.1f}%)")
+print(f"\nClass balance:")
+for k, v in classifications.items():
+    print(f"  {k}: {v} ({v/len(data)*100:.1f}%)")
+print(f"\nScenarios covered:    {len(scenarios)} unique scenarios")
+print(f"\nShortest llm_output:  {min(len(x['llm_output']) for x in data)} chars")
+print(f"Longest llm_output:   {max(len(x['llm_output']) for x in data)} chars")
+print(f"Avg llm_output:       {sum(len(x['llm_output']) for x in data)//len(data)} chars")
