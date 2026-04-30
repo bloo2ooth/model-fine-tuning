@@ -120,6 +120,7 @@ lora_config = LoraConfig(
 )
 
 model = get_peft_model(model, lora_config)
+model.enable_input_require_grads()
 model.print_trainable_parameters()
 
 # ── Training config ───────────────────────────────────────────────────────────
@@ -145,6 +146,7 @@ training_args = SFTConfig(
     lr_scheduler_type="cosine",
     warmup_ratio=0.03,
     bf16=True,
+    gradient_checkpointing=True,
     max_grad_norm=1.0,
     eval_strategy="steps",
     eval_steps=25,
