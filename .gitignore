@@ -10,15 +10,15 @@ __pycache__/
 .Python
 
 # Data files (can be large)
-data/*.jsonl
 data/*.csv
-data/*.json
 models/*.bin
 models/*.safetensors
 
-# GCP credentials
+# GCP credentials — scope tightly so data files are not excluded
 gcp-key.json
-*.json  # Service account keys
+*-key.json
+*-credentials.json
+service-account*.json
 
 # Environment variables
 .env
