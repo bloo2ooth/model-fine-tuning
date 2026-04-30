@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 import signal
 import sys
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
 
 # In-memory dataset -- signal handler needs access to this
 dataset = []
@@ -33,7 +35,6 @@ def handle_interrupt(sig, frame):
 # Register the signal handler once at startup
 signal.signal(signal.SIGINT, handle_interrupt)
 
-
 # Load environment variables
 load_dotenv()
 
@@ -44,8 +45,9 @@ ENDPOINT_ID = os.getenv('TEACHER_ENDPOINT_ID')
 # ============================================================
 # SAFETY LIMITS
 # ============================================================
-MAX_EXAMPLES      = 3000  # Hard cap on examples to generate
-MAX_RUNTIME_HOURS = 12    # Auto-stop after 12 hours
+MAX_EXAMPLES      = 3000
+MAX_RUNTIME_HOURS = 20   # Updated from 12
+MAX_WORKERS       = 7    # Updated from 5
 
 # Track start time
 START_TIME = datetime.datetime.now()
@@ -53,14 +55,40 @@ START_TIME = datetime.datetime.now()
 
 def check_runtime_limit():
     elapsed_hours = (datetime.datetime.now() - START_TIME).total_seconds() / 3600
-
     if elapsed_hours >= MAX_RUNTIME_HOURS:
         print(f"\nSAFETY STOP: Max runtime {MAX_RUNTIME_HOURS}h exceeded")
         print(f"Elapsed: {elapsed_hours:.2f} hours")
         save_checkpoint(dataset)
         return False
-
     return True
+
+
+def load_checkpoint(path="data/training_data_checkpoint.json"):
+    """
+    Load existing checkpoint if it exists.
+    Returns (examples_list, scenario_counts_dict).
+    scenario_counts tells us how many examples we already
+    have per scenario_type so we can skip completed ones.
+    """
+    if not os.path.exists(path):
+        print("No checkpoint found — starting fresh.")
+        return [], {}
+
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    if not data:
+        print("Checkpoint is empty — starting fresh.")
+        return [], {}
+
+    # Count how many examples we already have per scenario type
+    counts = Counter(item.get("scenario_type", "unknown") for item in data)
+    print(f"\nCheckpoint loaded: {len(data)} existing examples across {len(counts)} scenarios.")
+    print("Already completed:")
+    for scenario_type, count in counts.items():
+        print(f"  {scenario_type}: {count} examples")
+
+    return data, counts
 
 
 # Import scenarios
@@ -92,9 +120,7 @@ Output format - respond ONLY with valid JSON:
 
 
 def generate_user_prompt(scenario):
-    """Create user prompt for teacher model."""
     should_be = "IS" if scenario["should_be_advice"] else "IS NOT"
-
     return f"""Generate a realistic LLM output for this scenario that {should_be} financial advice.
 
 Context: {scenario['context']}
@@ -128,21 +154,17 @@ Respond with ONLY valid JSON (no extra text):
         )
 
         if not response.predictions or len(response.predictions) == 0:
-            print("[DEBUG] Empty predictions response")
             return None
 
         output_text = response.predictions[0]
 
-        # Remove prefix labels sometimes added by the model
         if "Output:" in output_text:
             output_text = output_text.split("Output:")[1]
 
-        # Find the first opening brace
         start_idx = output_text.find('{')
         if start_idx == -1:
             return None
 
-        # Walk the string character by character to find the first complete JSON object
         brace_count = 0
         in_string = False
         escape_next = False
@@ -151,26 +173,20 @@ Respond with ONLY valid JSON (no extra text):
             if escape_next:
                 escape_next = False
                 continue
-
             if char == '\\':
                 escape_next = True
                 continue
-
             if char == '"' and not escape_next:
                 in_string = not in_string
                 continue
-
             if not in_string:
                 if char == '{':
                     brace_count += 1
                 elif char == '}':
                     brace_count -= 1
-
                     if brace_count == 0:
                         json_str = output_text[start_idx:i+1]
                         result = json.loads(json_str)
-
-                        # Validate required fields
                         if 'llm_output' in result and 'classification' in result:
                             if 'reasoning' not in result:
                                 result['reasoning'] = "Generated classification"
@@ -186,7 +202,6 @@ Respond with ONLY valid JSON (no extra text):
                             return result
                         else:
                             return None
-
         return None
 
     except json.JSONDecodeError:
@@ -199,77 +214,81 @@ Respond with ONLY valid JSON (no extra text):
 def generate_example(scenario, retry_count=2):
     """Generate one example, retrying on failure."""
     prompt = generate_user_prompt(scenario)
-
     for attempt in range(retry_count):
-        print(f"\n[DEBUG] Attempt {attempt+1}/{retry_count} for scenario: {scenario['output_type']}")
         result = call_teacher_model(prompt)
-
         if result and 'llm_output' in result and 'classification' in result:
             result['scenario_type'] = scenario['output_type']
-            print(f"[DEBUG] Success: {result['classification']}")
             return result
-        else:
-            print(f"[DEBUG] Failed to get valid result")
-
         if attempt < retry_count - 1:
             time.sleep(2)
-
-    print(f"[DEBUG] Giving up after {retry_count} attempts")
     return None
 
 
+def generate_examples_concurrent(scenario, count, max_workers=MAX_WORKERS):
+    """Generate 'count' examples concurrently, over-submitting to account for failures."""
+    results = []
+    jobs_to_submit = count * 2
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(generate_example, scenario) for _ in range(jobs_to_submit)]
+        for future in as_completed(futures):
+            if len(results) >= count:
+                break
+            result = future.result()
+            if result is not None:
+                results.append(result)
+                print(f"[PROGRESS] {len(results)}/{count} for {scenario['output_type']}")
+
+    return results[:count]
+
+
 def create_training_dataset(num_examples=3000):
-    """Generate training dataset with runtime limit."""
-    global dataset  # Signal handler and check_runtime_limit must reference the same list
-    dataset = []
+    """Generate training dataset with checkpoint resume and runtime limit."""
+    global dataset
 
     os.makedirs('data', exist_ok=True)
-
     num_examples = min(num_examples, MAX_EXAMPLES)
     examples_per_scenario = num_examples // len(SCENARIOS)
+
+    # ── RESUME LOGIC ──────────────────────────────────────────
+    # Load existing checkpoint and count what's already done
+    dataset, completed_counts = load_checkpoint()
+    # ──────────────────────────────────────────────────────────
 
     print("=" * 70)
     print("SYNTHETIC DATA GENERATION")
     print("=" * 70)
     print(f"Target examples:  {num_examples}")
     print(f"Max runtime:      {MAX_RUNTIME_HOURS} hours")
+    print(f"Max workers:      {MAX_WORKERS}")
+    print(f"Resuming from:    {len(dataset)} existing examples")
     print(f"Endpoint:         {ENDPOINT_ID}")
     print("=" * 70)
 
     for scenario_idx, scenario in enumerate(SCENARIOS):
-        print(f"\n[{scenario_idx+1}/{len(SCENARIOS)}] Generating {examples_per_scenario} examples for: {scenario['output_type']}")
+        scenario_type = scenario['output_type']
+        already_have  = completed_counts.get(scenario_type, 0)
+        still_needed  = examples_per_scenario - already_have
 
-        successful = 0
-        attempts = 0
-        max_attempts = examples_per_scenario * 2
-        progress_bar = tqdm(total=examples_per_scenario)
+        # Skip fully completed scenarios
+        if still_needed <= 0:
+            print(f"\n[{scenario_idx+1}/{len(SCENARIOS)}] SKIP (already have {already_have}) : {scenario_type}")
+            continue
 
-        while successful < examples_per_scenario and attempts < max_attempts:
+        print(f"\n[{scenario_idx+1}/{len(SCENARIOS)}] Generating {still_needed} examples for: {scenario_type}")
+        print(f"  (already have {already_have}/{examples_per_scenario})")
 
-            if not check_runtime_limit():
-                progress_bar.close()
-                print(f"\nSTOPPING GENERATION - Runtime limit reached")
-                print(f"Generated {len(dataset)} examples so far")
-                return dataset
+        if not check_runtime_limit():
+            print(f"\nSTOPPING — Runtime limit reached after {len(dataset)} examples")
+            return dataset
 
-            example = generate_example(scenario)
-            attempts += 1
+        results = generate_examples_concurrent(scenario, still_needed, max_workers=MAX_WORKERS)
+        dataset.extend(results)
 
-            if example:
-                dataset.append(example)
-                successful += 1
-                progress_bar.update(1)
+        elapsed = (datetime.datetime.now() - START_TIME).total_seconds() / 3600
+        print(f"Generated {len(results)}/{still_needed} | Total: {len(dataset)} | Elapsed: {elapsed:.2f}h")
 
-            # Rate limiting -- print elapsed time every 10 attempts
-            if attempts % 10 == 0:
-                time.sleep(2)
-                elapsed = (datetime.datetime.now() - START_TIME).total_seconds() / 3600
-                print(f"\nElapsed: {elapsed:.2f}h")
-
-        progress_bar.close()
-        print(f"Generated {successful}/{examples_per_scenario}")
-
-        # Save checkpoint after every scenario in case of failure
+        # Save checkpoint after every scenario
         with open('data/training_data_checkpoint.json', 'w') as f:
             json.dump(dataset, f, indent=2)
 
@@ -290,6 +309,7 @@ if __name__ == "__main__":
     print("\nGENERATION CONFIRMATION")
     print(f"Target examples:  3000")
     print(f"Max runtime:      {MAX_RUNTIME_HOURS} hours")
+    print(f"Max workers:      {MAX_WORKERS}")
     response = input("\nProceed? (yes/no): ")
 
     if response.lower() != 'yes':
@@ -308,11 +328,11 @@ if __name__ == "__main__":
         print(f"Time elapsed:   {elapsed_hours:.2f} hours")
         print("=" * 70)
 
-        # Save raw data with all fields intact
+        # Save raw data
         with open('data/training_data_raw.json', 'w') as f:
             json.dump(training_data, f, indent=2)
 
-        # Format for Qwen fine-tuning using ChatML message structure
+        # Format for Qwen fine-tuning
         formatted_data = []
         skipped = 0
 
@@ -320,7 +340,6 @@ if __name__ == "__main__":
             if not all(k in item for k in ['llm_output', 'classification', 'reasoning', 'criteria_met']):
                 skipped += 1
                 continue
-
             if not isinstance(item['criteria_met'], dict):
                 skipped += 1
                 continue
@@ -353,25 +372,23 @@ if __name__ == "__main__":
             for item in formatted_data:
                 f.write(json.dumps(item) + '\n')
 
-        print(f"\nFormatted {len(formatted_data)} examples ({skipped} skipped due to missing fields)")
+        print(f"\nFormatted {len(formatted_data)} examples ({skipped} skipped)")
         print(f"Saved to data/training_data_qwen.jsonl")
 
         if len(training_data) > 0:
-            advice_count = sum(1 for d in training_data if d['classification'] == 'ADVICE')
+            advice_count     = sum(1 for d in training_data if d['classification'] == 'ADVICE')
             not_advice_count = len(training_data) - advice_count
             print(f"\nDataset Statistics:")
             print(f"  Total:       {len(training_data)}")
             print(f"  ADVICE:      {advice_count} ({advice_count/len(training_data)*100:.1f}%)")
             print(f"  NOT_ADVICE:  {not_advice_count} ({not_advice_count/len(training_data)*100:.1f}%)")
-        else:
-            print("\nWARNING: No examples generated!")
 
         print("\nSUCCESS - All data generated and saved!")
 
     except Exception as e:
         print(f"\nERROR: {e}")
-        print("Checkpoint may be available at: data/training_data_checkpoint.json")
+        print("Checkpoint available at: data/training_data_checkpoint.json")
 
     finally:
-        save_checkpoint(dataset)  # Runs on normal finish, error, or crash
+        save_checkpoint(dataset)
         print("\nRemember to undeploy your endpoint!")
