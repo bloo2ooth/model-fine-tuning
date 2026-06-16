@@ -11,5 +11,5 @@
 -  Generating 5,000 labeled examples
 
 ### Next Steps:
-- Fine-tune Llama-3-8B student model
+- Fine-tune Qwen-8B student model
 - Evaluate performance vs prompt-tuned baseline
